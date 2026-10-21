@@ -1,0 +1,1801 @@
+--[=[
+    Target: BloxStrike (Roblox)
+    PlaceId: 114234929420007 · UniverseId: 7633926880 · Build: 9958
+    Runtime: Luau / Madium Executor (Identity 8)
+    GUI: Gamesense / Linoria Architecture (lib.lua)
+    Design Specification: Full Unified Multi-Feature HvH & Rage Engine
+]=]
+
+local Bloxstrike = {}
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §0 — ANTI-CHEAT THREAT MODEL & ARCHITECTURAL SPECIFICATION
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+    DETECTION VECTOR ANALYSIS & PER-BUILD NEUTRALIZATION MATRIX:
+
+    [Vector 1]: BAC Remote Integrity & Heartbeat Probe
+      - Target: ReplicatedStorage.Remotes.BAC / NetworkRemotes.BAC
+      - Mechanism: Client-side integrity worker compiles checksums, hook heuristics,
+        and environment state, dispatching telemetry via BAC:FireServer().
+      - Neutralization: Metamethod / hookfunction detour on BAC remote instance. Silently
+        swallows outbound payloads while maintaining instance integrity in datamodel.
+
+    [Vector 2]: Weapon Network Ingestion Rate-Limiter (ShootWeapon Token Bucket)
+      - Target: ReplicatedStorage.NetworkRemotes.Inventory.ShootWeapon
+      - Mechanism: Server enforces strict rate limiting (20 RPS ceiling). Bursts exceeding
+        token bucket capacity trigger packet discard and server-side anomaly scoring.
+      - Neutralization: Client-side Token Bucket rate limiter metering bullet generation.
+        Silent aim raycasts respect rate budget, dropping or queueing excess injections.
+
+    [Vector 3]: Simulation Inconsistency via Bullet Raycast Override
+      - Target: ReplicatedStorage.Components.Weapon.Classes.Bullet._performRaycast
+      - Mechanism: Crosshair look-vector mismatch during remote dispatch.
+      - Neutralization: Hook Bullet._performRaycast directly. Calculate trajectory from
+        true camera/muzzle origin to resolved bone/backtrack position. Camera CFrame
+        and Viewport matrix remain 100% untouched.
+
+    [Vector 4]: MovementV2 Kinematics & Desync Anti-Aim Ingestion
+      - Target: ReplicatedStorage.MovementV2Remotes.OwnerSnapshot
+      - Mechanism: MovementV2 server worker verifies angular acceleration and camera snap
+        deltas across frames. Desync angle manipulation modifies LookYaw and VerticalLook
+        in the serialized StateCodec buffer (offset 25 in wire header).
+      - Neutralization: Outbound snapshot detour modifies LookYaw within legitimate quantization
+        bounds, desyncing rendered visual orientation while preserving server-accepted state.
+
+    [Vector 5]: Server Lag Compensation Window & Backtrack Exploitation
+      - Target: Server-side hit-registration history buffer (~200ms lag comp window)
+      - Mechanism: Server rewinds target hitboxes to past ticks to verify client shot.
+      - Neutralization: Circular snapshot buffer recording entity hitboxes at each tick.
+        When target is occluded or desynced at tick T0, silent aim targets accepted historical
+        record at tick T-k.
+]]
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §1 — CONFIGURATION HOLES & RUNTIME SCHEMA
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local Config = {
+    Target = {
+        PlaceId = 114234929420007,
+        UniverseId = 7633926880,
+        ExpectedPlaceVersion = 9958,
+        GameName = "[ZOMBIES!] BloxStrike",
+    },
+
+    Paths = {
+        ReplicatedStorage = "ReplicatedStorage",
+        NetworkRemotes = "NetworkRemotes",
+        Controllers = "Controllers",
+        Components = "Components",
+        Database = "Database",
+        Combatants = "Combatants",
+        Characters = "Characters",
+        MovementV2 = "MovementV2",
+    },
+
+    Remotes = {
+        BAC = "ReplicatedStorage.Remotes.BAC",
+        ShootWeaponNamespace = "Inventory",
+        ShootWeaponPacket = "ShootWeapon",
+        CharacterDamagedNamespace = "Character",
+        CharacterDamagedPacket = "CharacterDamaged",
+        OwnerSnapshot = "ReplicatedStorage.MovementV2Remotes.OwnerSnapshot",
+        RemoteSnapshot = "ReplicatedStorage.MovementV2Remotes.RemoteSnapshot",
+        Commands = "ReplicatedStorage.MovementV2Remotes.Commands",
+        Diagnostics = "ReplicatedStorage.MovementV2Remotes.Diagnostics",
+    },
+
+    Attributes = {
+        CharacterType = "CharacterType",
+        ExpectedCharacterType = "PlayerCustomCharacter",
+        Dead = "Dead",
+        Health = "Health",
+        MaxHealth = "MaxHealth",
+        Team = "Team",
+        Bot = "Bot",
+        CombatantId = "CombatantId",
+        DisplayName = "DisplayName",
+        AvatarUserId = "AvatarUserId",
+        Gamemode = "Gamemode",
+        VIPESP = "VIPESP",
+    },
+
+    NetworkLimits = {
+        ShootWeaponMaxRps = 20,
+    },
+
+    Bypass = {
+        EnforceRateLimits = true,
+        SilenceBAC = true,
+    },
+
+    Features = {
+        SilentAim = {
+            Enabled = true,
+            TargetPart = "Head",
+            FOV = 120,
+            HitChance = 100,
+            VisibleOnly = false,
+            DrawFOV = true,
+            FOVColor = Color3.fromRGB(120, 180, 255),
+        },
+        Aimbot = {
+            Enabled = false,
+            TargetMode = "ThreatPriority", -- "Crosshair", "Distance", "LowestHealth", "ThreatPriority"
+            TargetPart = "Head",
+            FOV = 80,
+            Smoothness = 0.20,
+            VisibleOnly = true,
+            DrawFOV = false,
+            FOVColor = Color3.fromRGB(255, 180, 60),
+        },
+        Triggerbot = {
+            Enabled = false,
+            Mode = "Tap", -- "Tap", "Hold"
+            DelayMs = 25,
+            FOVTolerance = 12,
+            VisibleOnly = true,
+        },
+        ESP = {
+            Enabled = true,
+            Boxes = true,
+            Skeleton = true,
+            Names = true,
+            HealthBar = true,
+            Distance = true,
+            MaxDistance = 1200,
+            ShowTeammates = false,
+            ShowBots = true,
+            EnemyVisibleColor = Color3.fromRGB(255, 65, 65),
+            EnemyHiddenColor = Color3.fromRGB(180, 40, 120),
+            TeamColor = Color3.fromRGB(60, 160, 245),
+            SkeletonColor = Color3.fromRGB(240, 240, 240),
+            BacktrackTrailColor = Color3.fromRGB(255, 200, 50),
+        },
+
+        -- ─── NEW HVH SUBSYSTEMS ───
+        Resolver = {
+            Enabled = true,
+            Mode = "AdaptiveAuto", -- "KinematicVelocity", "AnimationYawDelta", "InvertedFake", "AdaptiveAuto"
+            DesyncThresholdDegrees = 35,
+            ResolvePitch = true,
+            PitchOverride = "Zero", -- "Zero", "Down", "Up", "Preserve"
+            HeadOffsetHeight = 1.6,
+            HeadOffsetForward = 0.2,
+        },
+        Backtrack = {
+            Enabled = true,
+            WindowMs = 200,
+            MaxRecordsPerEntity = 14,
+            DrawRecords = true,
+            RecordColor = Color3.fromRGB(255, 215, 0),
+            FavorStationary = true,
+        },
+        Wallbang = {
+            Enabled = true,
+            MinDamage = 15,
+            MaxPenetrationDepth = 35,
+            ThroughBreakableDoors = true,
+            MaterialLimits = {
+                Plastic = 10,
+                SmoothPlastic = 10,
+                Wood = 10,
+                WoodPlanks = 10,
+                Cardboard = 10,
+                Glass = 25,
+                Fabric = 25,
+                Default = 0,
+            },
+        },
+        LeadPrediction = {
+            Enabled = true,
+            AccountForPing = true,
+            FixedPingMs = 80,
+            AccountForGravity = true,
+            DefaultProjectileSpeed = 3000,
+        },
+        AntiAim = {
+            Enabled = false,
+            YawMode = "Backward", -- "Backward", "Jitter", "Spin", "DesyncFlip"
+            JitterDelta = 75,
+            SpinSpeed = 15,
+            PitchMode = "Down", -- "Down", "Up", "Zero", "Jitter"
+            DesyncBreak = true,
+        },
+        Priority = {
+            Algorithm = "MultiMetricThreat",
+            AimingAtMeWeight = 1000,
+            CrosshairWeight = 300,
+            LowestHealthWeight = 200,
+            ExposureWeight = 250,
+            ThreatAngleThreshold = 0.85,
+        },
+        HitVerifier = {
+            Enabled = true,
+            TimeoutMs = 350,
+            AutoCorrectOnMisses = 2,
+            DrawHUD = true,
+            HUDPosition = Vector2.new(20, 300),
+        },
+    },
+}
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §2 — ENGINE SERVICES & RUNTIME MODULE RESOLUTION
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+
+local LocalPlayer = Players.LocalPlayer
+assert(LocalPlayer, "[Bloxstrike::Init] LocalPlayer instance unpopulated in datamodel")
+
+local CurrentCamera = Workspace.CurrentCamera
+assert(CurrentCamera, "[Bloxstrike::Init] CurrentCamera unpopulated in datamodel")
+
+-- Dynamic Game Module Resolution with verified assertions
+local CharacterResolver = require(ReplicatedStorage:WaitForChild("Components"):WaitForChild("Common"):WaitForChild("CharacterResolver"))
+local Participants = require(ReplicatedStorage:WaitForChild("Components"):WaitForChild("Common"):WaitForChild("Participants"))
+local RaycastModule = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Raycast"))
+local GetRayIgnore = require(ReplicatedStorage:WaitForChild("Components"):WaitForChild("Common"):WaitForChild("GetRayIgnore"))
+local BulletClass = require(ReplicatedStorage:WaitForChild("Components"):WaitForChild("Weapon"):WaitForChild("Classes"):WaitForChild("Bullet"))
+local RuntimeKinematics = require(ReplicatedStorage:WaitForChild("MovementV2"):WaitForChild("RuntimeKinematics"))
+local RootFrame = require(ReplicatedStorage:WaitForChild("MovementV2"):WaitForChild("RootFrame"))
+
+assert(BulletClass and BulletClass._performRaycast, "[Bloxstrike::Init] Bullet._performRaycast target function missing")
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §3 — ANTI-CHEAT BYPASS & TOKEN BUCKET ENGINE
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local BypassState = {
+    OriginalRaycast = nil,
+    Hooks = {},
+    LastShotTimestamp = 0,
+    ShotTokens = Config.NetworkLimits.ShootWeaponMaxRps,
+    MaxShotTokens = Config.NetworkLimits.ShootWeaponMaxRps,
+    RefillRate = Config.NetworkLimits.ShootWeaponMaxRps,
+}
+
+function BypassState:ConsumeShotToken()
+    if not Config.Bypass.EnforceRateLimits then return true end
+    local now = os.clock()
+    local elapsed = now - self.LastShotTimestamp
+    self.LastShotTimestamp = now
+    self.ShotTokens = math.min(self.MaxShotTokens, self.ShotTokens + elapsed * self.RefillRate)
+
+    if self.ShotTokens >= 1 then
+        self.ShotTokens = self.ShotTokens - 1
+        return true
+    end
+    return false
+end
+
+-- Forward declarations for unified resolver targets
+local ActiveSilentTarget = nil
+local ActiveBacktrackRecord = nil
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §4 — UNIFIED ENTITY RESOLUTION & SKELETON RECONSTRUCTION
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local CachedEntities = {}
+local LastEntityCacheUpdate = 0
+
+function Bloxstrike:GetLocalTeam()
+    local gamemode = Workspace:GetAttribute(Config.Attributes.Gamemode)
+    if gamemode == "Deathmatch" then
+        return "FFA"
+    end
+    return LocalPlayer:GetAttribute(Config.Attributes.Team) or (LocalPlayer.Team and LocalPlayer.Team.Name) or "None"
+end
+
+function Bloxstrike:IsEnemy(combatant)
+    if combatant == LocalPlayer then
+        return false
+    end
+    if not Participants.IsAlive(combatant) then
+        return false
+    end
+
+    local localTeam = self:GetLocalTeam()
+    if localTeam == "FFA" then
+        return true
+    end
+
+    local targetTeam = combatant:GetAttribute(Config.Attributes.Team)
+    if targetTeam and (targetTeam == "Terrorists" or targetTeam == "Counter-Terrorists") then
+        return targetTeam ~= localTeam
+    end
+
+    return false
+end
+
+local function ResolveBones(character)
+    local bones = {}
+    local partNames = {
+        "Head", "UpperTorso", "LowerTorso", "Torso", "HumanoidRootPart",
+        "LeftUpperArm", "LeftLowerArm", "LeftHand", "Left Arm",
+        "RightUpperArm", "RightLowerArm", "RightHand", "Right Arm",
+        "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "Left Leg",
+        "RightUpperLeg", "RightLowerLeg", "RightFoot", "Right Leg"
+    }
+    for _, name in ipairs(partNames) do
+        local p = character:FindFirstChild(name)
+        if p and p:IsA("BasePart") then
+            bones[name] = p
+        end
+    end
+    return bones
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §5 — DESYNC RESOLVER ENGINE (BEATS FAKE ANGLES & HITBOX SPOOFING)
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+    Mechanism: Reconstructs true authoritative server hitbox orientation using
+    MovementV2 RuntimeKinematics velocity vector and animation look delta.
+]]
+
+local ResolverState = {
+    EntityData = {}, -- [combatant] = { MissCount = 0, LastResolvedYaw = 0, ResolvedMode = "" }
+}
+
+function Bloxstrike:ResolveTrueHitbox(combatant, character, rootPart, head)
+    if not Config.Features.Resolver.Enabled then
+        return head.Position, rootPart.CFrame
+    end
+
+    local data = ResolverState.EntityData[combatant]
+    if not data then
+        data = { MissCount = 0, LastResolvedYaw = 0, Inverted = false }
+        ResolverState.EntityData[combatant] = data
+    end
+
+    -- 1. Query authoritative kinematics from MovementV2
+    local vel, horizVel, speed, velY, onGround, isTracked = RuntimeKinematics.resolve(combatant, rootPart)
+    local renderedYaw = select(2, rootPart.CFrame:ToEulerAnglesYXZ())
+    local trueYaw = renderedYaw
+    local resolvedMode = Config.Features.Resolver.Mode
+
+    if resolvedMode == "AdaptiveAuto" then
+        -- Automatically switch to inverted fake if consecutive shots miss
+        if data.MissCount >= Config.Features.HitVerifier.AutoCorrectOnMisses then
+            resolvedMode = "InvertedFake"
+        elseif speed > 1.5 then
+            resolvedMode = "KinematicVelocity"
+        else
+            resolvedMode = "AnimationYawDelta"
+        end
+    end
+
+    if resolvedMode == "KinematicVelocity" and speed > 1.2 then
+        -- Movement vector is authoritative: player cannot desync heading while moving fast
+        trueYaw = math.atan2(-horizVel.X, -horizVel.Z)
+    elseif resolvedMode == "AnimationYawDelta" then
+        -- Compare Head look vector with root orientation to detect decoupled fake angles
+        local headLook = head.CFrame.LookVector
+        local headYaw = math.atan2(-headLook.X, -headLook.Z)
+        local delta = math.abs(math.deg(headYaw - renderedYaw))
+        if delta > Config.Features.Resolver.DesyncThresholdDegrees then
+            -- Severe angle disparity detected: real hitbox stays near eye center
+            trueYaw = headYaw
+        end
+    elseif resolvedMode == "InvertedFake" then
+        -- Invert rendered yaw by 180 or opposite desync side
+        trueYaw = renderedYaw + math.pi
+    end
+
+    data.LastResolvedYaw = trueYaw
+    data.ResolvedMode = resolvedMode
+
+    -- Reconstruct authoritative Root CFrame and Head Position
+    local resolvedRootCF = CFrame.new(rootPart.Position) * CFrame.Angles(0, trueYaw, 0)
+    local forwardVec = resolvedRootCF.LookVector
+    local resolvedHeadPos = rootPart.Position + Vector3.new(0, Config.Features.Resolver.HeadOffsetHeight, 0)
+        + (forwardVec * Config.Features.Resolver.HeadOffsetForward)
+
+    return resolvedHeadPos, resolvedRootCF
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §6 — LAG COMPENSATION & BACKTRACK ENGINE
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+    Mechanism: Circular snapshot buffer storing per-combatant hitbox positions
+    within the server's 200ms lag compensation window.
+]]
+
+local BacktrackBuffer = {} -- [combatant] = { { Timestamp, RootCF, HeadPos, Bones, Velocity } }
+
+function Bloxstrike:UpdateBacktrackRecords()
+    if not Config.Features.Backtrack.Enabled then return end
+
+    local now = os.clock()
+    local maxAge = Config.Features.Backtrack.WindowMs / 1000
+
+    for _, ent in ipairs(CachedEntities) do
+        if ent.IsEnemy then
+            local combatant = ent.Combatant
+            local records = BacktrackBuffer[combatant]
+            if not records then
+                records = {}
+                BacktrackBuffer[combatant] = records
+            end
+
+            -- Prune outdated snapshots exceeding server rewind capacity
+            for i = #records, 1, -1 do
+                if now - records[i].Timestamp > maxAge then
+                    table.remove(records, i)
+                end
+            end
+
+            -- Capture current tick snapshot
+            local bonePositions = {}
+            for name, part in pairs(ent.Bones) do
+                bonePositions[name] = part.Position
+            end
+
+            local resolvedHead, resolvedRootCF = self:ResolveTrueHitbox(combatant, ent.Character, ent.RootPart, ent.Head)
+
+            table.insert(records, 1, {
+                Timestamp = now,
+                HeadPosition = resolvedHead,
+                RootCFrame = resolvedRootCF,
+                Bones = bonePositions,
+                Velocity = ent.RootPart.AssemblyLinearVelocity,
+                Distance = ent.DistanceCamera,
+            })
+
+            -- Maintain buffer size
+            while #records > Config.Features.Backtrack.MaxRecordsPerEntity do
+                table.remove(records)
+            end
+        end
+    end
+end
+
+function Bloxstrike:FindBestBacktrackRecord(combatant, fovLimit)
+    if not Config.Features.Backtrack.Enabled then return nil end
+
+    local records = BacktrackBuffer[combatant]
+    if not records or #records == 0 then return nil end
+
+    local origin = CurrentCamera.CFrame.Position
+    local viewportCenter = Vector2.new(CurrentCamera.ViewportSize.X / 2, CurrentCamera.ViewportSize.Y / 2)
+    local bestRecord = nil
+    local bestScore = math.huge
+
+    for _, rec in ipairs(records) do
+        local screenPos, onScreen = CurrentCamera:WorldToViewportPoint(rec.HeadPosition)
+        if onScreen and screenPos.Z > 0 then
+            local dist = (Vector2.new(screenPos.X, screenPos.Y) - viewportCenter).Magnitude
+            if dist <= fovLimit then
+                local isVis = self:IsVisible(origin, rec.HeadPosition, ent and ent.Head)
+                -- Favor stationary or fully exposed records
+                local speed = rec.Velocity.Magnitude
+                local score = dist + (speed * 5) - (isVis and 200 or 0)
+                if score < bestScore then
+                    bestScore = score
+                    bestRecord = rec
+                end
+            end
+        end
+    end
+
+    return bestRecord
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §7 — PENETRATION & WALLBANG SOLVER (AUTO-WALL ENGINE)
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+    Mechanism: Traces obstacles along bullet trajectory, computes material thickness
+    via bidirectional raycasting, and checks against weapon penetration capacity.
+]]
+
+function Bloxstrike:EvaluatePenetration(origin, targetPos, weaponPenetration)
+    if not Config.Features.Wallbang.Enabled then
+        local isVis = self:IsDirectVisible(origin, targetPos)
+        return isVis, isVis and 100 or 0
+    end
+
+    local direction = targetPos - origin
+    local totalDistance = direction.Magnitude
+    if totalDistance <= 0.1 then return true, 100 end
+
+    local unitDir = direction.Unit
+    local ignoreList = GetRayIgnore()
+    local accumulatedThickness = 0
+    local maxPenetration = weaponPenetration or Config.Features.Wallbang.MaxPenetrationDepth
+
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = ignoreList
+    rayParams.IgnoreWater = true
+    rayParams.CollisionGroup = "Bullet"
+
+    local currentOrigin = origin
+    local remainingDist = totalDistance
+
+    for step = 1, 4 do
+        local hit = Workspace:Raycast(currentOrigin, unitDir * remainingDist, rayParams)
+        if not hit then
+            -- Reached target without further obstructions
+            local damageFactor = math.clamp(1 - (accumulatedThickness / maxPenetration), 0.15, 1.0)
+            local finalDamage = 100 * damageFactor
+            return (finalDamage >= Config.Features.Wallbang.MinDamage), finalDamage
+        end
+
+        local hitPart = hit.Instance
+        local hitPos = hit.Position
+
+        -- Check material penetration capability from Bloxstrike database
+        local matName = hitPart.Material.Name
+        local matAllowance = Config.Features.Wallbang.MaterialLimits[matName] or Config.Features.Wallbang.MaterialLimits.Default
+
+        if hitPart.Parent and hitPart.Parent:HasTag("BreakableDoor") and Config.Features.Wallbang.ThroughBreakableDoors then
+            matAllowance = 25
+        end
+
+        if matAllowance <= 0 and maxPenetration <= 0 then
+            return false, 0
+        end
+
+        -- Measure barrier depth via reverse raycast
+        local reverseOrigin = hitPos + (unitDir * 10)
+        local reverseRay = Workspace:Raycast(reverseOrigin, -unitDir * 10, rayParams)
+        local exitPos = reverseRay and reverseRay.Position or (hitPos + unitDir * 0.5)
+        local barrierThickness = (exitPos - hitPos).Magnitude
+
+        accumulatedThickness = accumulatedThickness + barrierThickness
+
+        if accumulatedThickness > maxPenetration + matAllowance then
+            return false, 0 -- Exceeded allowable wallbang limit
+        end
+
+        -- Advance ray beyond obstacle
+        currentOrigin = exitPos + (unitDir * 0.1)
+        remainingDist = (targetPos - currentOrigin).Magnitude
+        if remainingDist <= 0.2 then
+            break
+        end
+    end
+
+    local damageFraction = math.clamp(1 - (accumulatedThickness / maxPenetration), 0.15, 1.0)
+    local estimatedDamage = 100 * damageFraction
+    return (estimatedDamage >= Config.Features.Wallbang.MinDamage), estimatedDamage
+end
+
+function Bloxstrike:IsDirectVisible(origin, targetPos)
+    local ignoreList = GetRayIgnore()
+    local rayParams = RaycastParams.new()
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.FilterDescendantsInstances = ignoreList
+    rayParams.IgnoreWater = true
+
+    local direction = targetPos - origin
+    local result = Workspace:Raycast(origin, direction, rayParams)
+    return (result == nil)
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §8 — KINEMATIC LEAD PREDICTION ENGINE
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+    Mechanism: Leads moving targets by weapon flight time and network latency,
+    solving ballistic parabolic trajectory for moving/jumping combatants.
+]]
+
+function Bloxstrike:PredictKinematicPosition(origin, targetPos, velocity, isAirborne, projectileSpeed)
+    if not Config.Features.LeadPrediction.Enabled then
+        return targetPos
+    end
+
+    local speed = projectileSpeed or Config.Features.LeadPrediction.DefaultProjectileSpeed
+    local dist = (targetPos - origin).Magnitude
+
+    -- Compute flight time and network latency delta
+    local flightTime = (speed > 0 and speed < 10000) and (dist / speed) or 0
+    local pingTime = Config.Features.LeadPrediction.AccountForPing and (Config.Features.LeadPrediction.FixedPingMs / 1000) or 0
+    local totalLeadTime = flightTime + pingTime
+
+    local predicted = targetPos + (velocity * totalLeadTime)
+
+    -- Compensate vertical gravity drop if target is in air
+    if isAirborne and Config.Features.LeadPrediction.AccountForGravity then
+        local gravity = Workspace.Gravity
+        local verticalDisplacement = (velocity.Y * totalLeadTime) - (0.5 * gravity * (totalLeadTime ^ 2))
+        predicted = Vector3.new(predicted.X, targetPos.Y + verticalDisplacement, predicted.Z)
+    end
+
+    return predicted
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §9 — ANTI-AIM & FAKE-ANGLE DESYNC ENGINE
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+    Mechanism: Manipulates outbound MovementV2 OwnerSnapshot LookYaw/VerticalLook
+    bytes, presenting a spoofed visual model to enemy aimbots while preserving server state.
+]]
+
+local AntiAimState = {
+    CurrentSpinAngle = 0,
+    JitterFlip = false,
+    DesyncFlip = false,
+}
+
+function Bloxstrike:GenerateAntiAimAngles(cameraCF)
+    if not Config.Features.AntiAim.Enabled then
+        return nil, nil
+    end
+
+    local baseYaw = select(2, cameraCF:ToEulerAnglesYXZ())
+    local fakeYaw = baseYaw
+    local fakePitch = 0
+
+    -- 1. Resolve Fake Yaw
+    local mode = Config.Features.AntiAim.YawMode
+    if mode == "Backward" then
+        fakeYaw = baseYaw + math.pi
+    elseif mode == "Jitter" then
+        AntiAimState.JitterFlip = not AntiAimState.JitterFlip
+        local delta = math.rad(Config.Features.AntiAim.JitterDelta)
+        fakeYaw = baseYaw + (AntiAimState.JitterFlip and delta or -delta)
+    elseif mode == "Spin" then
+        AntiAimState.CurrentSpinAngle = (AntiAimState.CurrentSpinAngle + math.rad(Config.Features.AntiAim.SpinSpeed)) % (2 * math.pi)
+        fakeYaw = baseYaw + AntiAimState.CurrentSpinAngle
+    elseif mode == "DesyncFlip" then
+        AntiAimState.DesyncFlip = not AntiAimState.DesyncFlip
+        fakeYaw = baseYaw + (AntiAimState.DesyncFlip and math.rad(90) or math.rad(-90))
+    end
+
+    -- 2. Resolve Fake Pitch
+    local pitchMode = Config.Features.AntiAim.PitchMode
+    if pitchMode == "Down" then
+        fakePitch = math.rad(-89)
+    elseif pitchMode == "Up" then
+        fakePitch = math.rad(89)
+    elseif pitchMode == "Zero" then
+        fakePitch = 0
+    elseif pitchMode == "Jitter" then
+        fakePitch = AntiAimState.JitterFlip and math.rad(-89) or math.rad(89)
+    end
+
+    return fakeYaw, fakePitch
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §10 — MULTI-METRIC THREAT TARGET-PRIORITY RESOLVER
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+    Mechanism: Computes weighted threat scores across visible and wallbangable
+    enemies, feeding a single authoritative target to Silent Aim, Aimbot, and Triggerbot.
+]]
+
+function Bloxstrike:EvaluateTargetThreat(ent, screenDist, fovLimit, isVisible, wallbangDamage)
+    local myPos = CurrentCamera.CFrame.Position
+    local enemyHead = ent.Head
+    local threatScore = 0
+
+    -- Metric 1: Threat factor — Is the enemy aiming at LocalPlayer?
+    local enemyLook = enemyHead.CFrame.LookVector
+    local dirToMe = (myPos - enemyHead.Position).Unit
+    local aimDot = enemyLook:Dot(dirToMe)
+    if aimDot > Config.Features.Priority.ThreatAngleThreshold then
+        threatScore = threatScore + (Config.Features.Priority.AimingAtMeWeight * aimDot)
+    end
+
+    -- Metric 2: Crosshair proximity
+    local fovFraction = math.clamp(1 - (screenDist / fovLimit), 0, 1)
+    threatScore = threatScore + (Config.Features.Priority.CrosshairWeight * fovFraction)
+
+    -- Metric 3: Vulnerability (Lowest health target prioritization)
+    local healthFraction = math.clamp(1 - (ent.Health / ent.MaxHealth), 0, 1)
+    threatScore = threatScore + (Config.Features.Priority.LowestHealthWeight * healthFraction)
+
+    -- Metric 4: Exposure & Damage Viability
+    local exposureFraction = isVisible and 1.0 or (wallbangDamage / 100)
+    threatScore = threatScore + (Config.Features.Priority.ExposureWeight * exposureFraction)
+
+    return threatScore
+end
+
+function Bloxstrike:ResolveTarget(options)
+    local fovLimit = options.FOV or 120
+    local partName = options.TargetPart or "Head"
+    local origin = CurrentCamera.CFrame.Position
+    local viewportCenter = Vector2.new(CurrentCamera.ViewportSize.X / 2, CurrentCamera.ViewportSize.Y / 2)
+    local entities = self:UpdateEntityCache()
+
+    local bestCandidate = nil
+    local bestThreatScore = -math.huge
+
+    for _, ent in ipairs(entities) do
+        if ent.IsEnemy then
+            local targetPart = (partName == "Head") and ent.Head or ent.RootPart
+            local resolvedHead, resolvedRootCF = self:ResolveTrueHitbox(ent.Combatant, ent.Character, ent.RootPart, ent.Head)
+            local baseHitPos = (partName == "Head") and resolvedHead or resolvedRootCF.Position
+
+            -- Kinematic Lead Prediction
+            local predictedHitPos = self:PredictKinematicPosition(
+                origin,
+                baseHitPos,
+                ent.RootPart.AssemblyLinearVelocity,
+                not ent.RootPart:GetAttribute("OnGround"),
+                Config.Features.LeadPrediction.DefaultProjectileSpeed
+            )
+
+            local screenPos, onScreen = CurrentCamera:WorldToViewportPoint(predictedHitPos)
+
+            if onScreen and screenPos.Z > 0 then
+                local screenDist = (Vector2.new(screenPos.X, screenPos.Y) - viewportCenter).Magnitude
+
+                if screenDist <= fovLimit then
+                    local isVis = self:IsDirectVisible(origin, predictedHitPos)
+                    local canWallbang, wbDamage = false, 0
+
+                    if not isVis and Config.Features.Wallbang.Enabled then
+                        canWallbang, wbDamage = self:EvaluatePenetration(origin, predictedHitPos, 35)
+                    end
+
+                    if isVis or canWallbang or not options.VisibleOnly then
+                        local threat = self:EvaluateTargetThreat(ent, screenDist, fovLimit, isVis, wbDamage)
+
+                        if threat > bestThreatScore then
+                            bestThreatScore = threat
+                            bestCandidate = {
+                                Entity = ent,
+                                TargetPart = targetPart,
+                                HitPosition = predictedHitPos,
+                                ScreenPosition = Vector2.new(screenPos.X, screenPos.Y),
+                                ScreenDistance = screenDist,
+                                IsVisible = isVis,
+                                IsWallbang = canWallbang,
+                                WallbangDamage = wbDamage,
+                                ThreatScore = threat,
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- If no direct candidate found, check Backtrack Buffer
+    if not bestCandidate and Config.Features.Backtrack.Enabled then
+        for _, ent in ipairs(entities) do
+            if ent.IsEnemy then
+                local rec = self:FindBestBacktrackRecord(ent.Combatant, fovLimit)
+                if rec then
+                    local screenPos = CurrentCamera:WorldToViewportPoint(rec.HeadPosition)
+                    bestCandidate = {
+                        Entity = ent,
+                        TargetPart = ent.Head,
+                        HitPosition = rec.HeadPosition,
+                        ScreenPosition = Vector2.new(screenPos.X, screenPos.Y),
+                        ScreenDistance = (Vector2.new(screenPos.X, screenPos.Y) - viewportCenter).Magnitude,
+                        IsVisible = true,
+                        IsBacktrack = true,
+                        BacktrackRecord = rec,
+                    }
+                    break
+                end
+            end
+        end
+    end
+
+    return bestCandidate
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §11 — HIT-REGISTRATION VERIFIER & TELEMETRY AUDITOR
+-- ══════════════════════════════════════════════════════════════════════════════
+--[[
+    Mechanism: Audits outbound bullet timestamps against incoming CharacterDamaged
+    events, catching silent server rejections and dynamically adapting resolver angles.
+]]
+
+local HitVerifierState = {
+    TotalFired = 0,
+    TotalHits = 0,
+    TotalMisses = 0,
+    PendingShots = {}, -- [id] = { Timestamp, Combatant, TargetPos }
+    RecentMisses = 0,
+    LastLatencyMs = 0,
+}
+
+function Bloxstrike:RegisterFiredShot(targetCandidate)
+    if not Config.Features.HitVerifier.Enabled or not targetCandidate then return end
+
+    HitVerifierState.TotalFired = HitVerifierState.TotalFired + 1
+    local shotId = tostring(os.clock()) .. "_" .. tostring(HitVerifierState.TotalFired)
+
+    HitVerifierState.PendingShots[shotId] = {
+        Timestamp = os.clock(),
+        Combatant = targetCandidate.Entity.Combatant,
+        Candidate = targetCandidate,
+    }
+
+    -- Timeout watchdog: flag silent miss if server doesn't respond within window
+    task.delay(Config.Features.HitVerifier.TimeoutMs / 1000, function()
+        if HitVerifierState.PendingShots[shotId] then
+            HitVerifierState.PendingShots[shotId] = nil
+            HitVerifierState.TotalMisses = HitVerifierState.TotalMisses + 1
+            HitVerifierState.RecentMisses = HitVerifierState.RecentMisses + 1
+
+            -- Feedback loop: Auto-correct resolver angle on consecutive misses
+            local entData = ResolverState.EntityData[targetCandidate.Entity.Combatant]
+            if entData then
+                entData.MissCount = entData.MissCount + 1
+            end
+        end
+    end)
+end
+
+function Bloxstrike:InstallHitVerifier()
+    local charFolder = ReplicatedStorage:FindFirstChild("NetworkRemotes") and ReplicatedStorage.NetworkRemotes:FindFirstChild("Character")
+    local damagedRemote = charFolder and charFolder:FindFirstChild("CharacterDamaged")
+
+    if damagedRemote then
+        local conn = damagedRemote.OnClientEvent:Connect(function(packet)
+            local victimUserId = packet and packet.VictimUserId
+            local now = os.clock()
+
+            for shotId, shot in pairs(HitVerifierState.PendingShots) do
+                local combatant = shot.Combatant
+                local avatarId = combatant:GetAttribute(Config.Attributes.AvatarUserId) or (combatant.UserId)
+
+                if victimUserId == avatarId or not victimUserId then
+                    HitVerifierState.LastLatencyMs = math.floor((now - shot.Timestamp) * 1000)
+                    HitVerifierState.TotalHits = HitVerifierState.TotalHits + 1
+                    HitVerifierState.RecentMisses = 0
+                    HitVerifierState.PendingShots[shotId] = nil
+
+                    local entData = ResolverState.EntityData[combatant]
+                    if entData then
+                        entData.MissCount = 0
+                    end
+                    break
+                end
+            end
+        end)
+        table.insert(BypassState.Hooks, function() conn:Disconnect() end)
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §12 — IN-SIMULATION BYPASS & SILENT AIM INJECTION
+-- ══════════════════════════════════════════════════════════════════════════════
+
+function Bloxstrike:InstallBypass()
+    if BypassState.OriginalRaycast then return end
+
+    -- Hook Bullet._performRaycast: Pure in-memory vector redirection without moving camera
+    BypassState.OriginalRaycast = BulletClass._performRaycast
+    BulletClass._performRaycast = function(bulletInstance, spreadAngle)
+        if Config.Features.SilentAim.Enabled and ActiveSilentTarget and ActiveSilentTarget.HitPosition then
+            -- Hit chance roll
+            if Config.Features.SilentAim.HitChance < 100 and math.random(1, 100) > Config.Features.SilentAim.HitChance then
+                return BypassState.OriginalRaycast(bulletInstance, spreadAngle)
+            end
+
+            -- Respect rate limit token bucket to prevent server-side drop
+            if BypassState:ConsumeShotToken() then
+                local ignoreList = GetRayIgnore()
+                local origin = CurrentCamera.CFrame.Position
+                local targetPos = ActiveSilentTarget.HitPosition
+                local direction = (targetPos - origin).Unit
+                local range = bulletInstance.Properties.Range or 500
+                local penetration = bulletInstance.Properties.Penetration or 35
+
+                -- Audit shot in Hit-Registration Verifier
+                Bloxstrike:RegisterFiredShot(ActiveSilentTarget)
+
+                -- Internal game raycaster execution
+                local hitResult = RaycastModule.castThroughDistance(
+                    origin,
+                    direction * range,
+                    penetration,
+                    ignoreList
+                )
+
+                local hitsList = {}
+                local totalDist = range
+                local firstHit = hitResult[1]
+                if firstHit then
+                    totalDist = (firstHit.position - origin).Magnitude
+                end
+
+                for idx = 1, #hitResult do
+                    local h = hitResult[idx]
+                    if h.instance and h.material then
+                        table.insert(hitsList, {
+                            Position = h.position,
+                            Instance = h.instance,
+                            Material = h.material.Name,
+                            Normal = h.normal or Vector3.new(0, 0, 0),
+                            Exit = (idx % 2 == 0),
+                        })
+                    end
+                end
+
+                return {
+                    Origin = origin,
+                    Direction = direction,
+                    Distance = totalDist,
+                    Hits = hitsList,
+                }
+            end
+        end
+
+        return BypassState.OriginalRaycast(bulletInstance, spreadAngle)
+    end
+
+    table.insert(BypassState.Hooks, function()
+        BulletClass._performRaycast = BypassState.OriginalRaycast
+        BypassState.OriginalRaycast = nil
+    end)
+
+    -- Silence BAC Integrity Probe Remote
+    if Config.Bypass.SilenceBAC then
+        local bacRemote = ReplicatedStorage:FindFirstChild("Remotes") and ReplicatedStorage.Remotes:FindFirstChild("BAC")
+        if not bacRemote and ReplicatedStorage:FindFirstChild("NetworkRemotes") then
+            bacRemote = ReplicatedStorage.NetworkRemotes:FindFirstChild("BAC")
+        end
+
+        if bacRemote and hookfunction then
+            local oldFire = bacRemote.FireServer
+            hookfunction(bacRemote.FireServer, function(self, ...)
+                if self == bacRemote then
+                    return
+                end
+                return oldFire(self, ...)
+            end)
+            table.insert(BypassState.Hooks, function()
+                hookfunction(bacRemote.FireServer, oldFire)
+            end)
+        elseif hookmetamethod then
+            local oldNamecall
+            oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+                local method = getnamecallmethod()
+                if (method == "FireServer" or method == "fireServer") and (self == bacRemote or self.Name == "BAC") then
+                    return
+                end
+                return oldNamecall(self, ...)
+            end)
+            table.insert(BypassState.Hooks, function()
+                hookmetamethod(game, "__namecall", oldNamecall)
+            end)
+        end
+    end
+
+    -- Install Server Damage Telemetry Verifier
+    self:InstallHitVerifier()
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §13 — DRAWING PIPELINE (ESP, SKELETONS, BACKTRACK TRAILS, & HUD)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local ESPRegistry = {}
+local BacktrackDrawings = {}
+local SilentFOVCircle = nil
+local AimFOVCircle = nil
+local HitHUD = nil
+
+local function EnsureCircle(name, color, radius)
+    local c = Drawing.new("Circle")
+    c.Thickness = 1.5
+    c.NumSides = 64
+    c.Filled = false
+    c.Transparency = 0.75
+    c.Color = color
+    c.Radius = radius
+    c.Visible = false
+    return c
+end
+
+local function CreateDrawings(entity)
+    local box = Drawing.new("Square")
+    box.Thickness = 1
+    box.Filled = false
+    box.Color = Config.Features.ESP.EnemyVisibleColor
+    box.Visible = false
+
+    local boxOutline = Drawing.new("Square")
+    boxOutline.Thickness = 3
+    boxOutline.Filled = false
+    boxOutline.Color = Color3.new(0, 0, 0)
+    boxOutline.Visible = false
+
+    local nameLabel = Drawing.new("Text")
+    nameLabel.Size = 13
+    nameLabel.Center = true
+    nameLabel.Outline = true
+    nameLabel.Color = Color3.new(1, 1, 1)
+    nameLabel.Visible = false
+
+    local distLabel = Drawing.new("Text")
+    distLabel.Size = 12
+    distLabel.Center = true
+    distLabel.Outline = true
+    distLabel.Color = Color3.fromRGB(200, 200, 200)
+    distLabel.Visible = false
+
+    local healthBar = Drawing.new("Line")
+    healthBar.Thickness = 2
+    healthBar.Color = Color3.fromRGB(0, 255, 0)
+    healthBar.Visible = false
+
+    local healthBarOutline = Drawing.new("Line")
+    healthBarOutline.Thickness = 4
+    healthBarOutline.Color = Color3.new(0, 0, 0)
+    healthBarOutline.Visible = false
+
+    local skeletonLines = {}
+    for i = 1, 14 do
+        local l = Drawing.new("Line")
+        l.Thickness = 1.2
+        l.Color = Config.Features.ESP.SkeletonColor
+        l.Visible = false
+        table.insert(skeletonLines, l)
+    end
+
+    return {
+        Box = box,
+        BoxOutline = boxOutline,
+        Name = nameLabel,
+        Distance = distLabel,
+        HealthBar = healthBar,
+        HealthBarOutline = healthBarOutline,
+        SkeletonLines = skeletonLines,
+    }
+end
+
+local SkeletonJoints = {
+    {"Head", "UpperTorso"},
+    {"UpperTorso", "LowerTorso"},
+    {"UpperTorso", "Torso"},
+    {"UpperTorso", "LeftUpperArm"},
+    {"LeftUpperArm", "LeftLowerArm"},
+    {"LeftLowerArm", "LeftHand"},
+    {"Torso", "Left Arm"},
+    {"UpperTorso", "RightUpperArm"},
+    {"RightUpperArm", "RightLowerArm"},
+    {"RightLowerArm", "RightHand"},
+    {"Torso", "Right Arm"},
+    {"LowerTorso", "LeftUpperLeg"},
+    {"LeftUpperLeg", "LeftLowerLeg"},
+    {"LeftLowerLeg", "LeftFoot"},
+    {"Torso", "Left Leg"},
+    {"LowerTorso", "RightUpperLeg"},
+    {"RightUpperLeg", "RightLowerLeg"},
+    {"RightLowerLeg", "RightFoot"},
+    {"Torso", "Right Leg"},
+}
+
+function Bloxstrike:UpdateEntityCache()
+    local now = os.clock()
+    if now - LastEntityCacheUpdate < 0.016 then
+        return CachedEntities
+    end
+    LastEntityCacheUpdate = now
+
+    local entities = {}
+    local allCombatants = Participants.GetAll()
+    local localOrigin = CurrentCamera.CFrame.Position
+    local localPlayerPos = (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")) and LocalPlayer.Character.HumanoidRootPart.Position or localOrigin
+
+    for _, combatant in ipairs(allCombatants) do
+        local isBot = Participants.IsBot(combatant)
+        if not isBot or Config.Features.ESP.ShowBots then
+            local isEnemy = self:IsEnemy(combatant)
+            if isEnemy or Config.Features.ESP.ShowTeammates then
+                local character = Participants.Character(combatant)
+                if character and character:IsDescendantOf(Workspace) and character:GetAttribute(Config.Attributes.Dead) ~= true then
+                    local rootPart = CharacterResolver.getRootPart(character)
+                    local head = CharacterResolver.getHead(character)
+                    if rootPart and head then
+                        local health = character:GetAttribute(Config.Attributes.Health) or 100
+                        local maxHealth = character:GetAttribute(Config.Attributes.MaxHealth) or 100
+                        local name = Participants.Name(combatant) or character.Name
+                        local distStuds = (localOrigin - rootPart.Position).Magnitude
+                        local distPlayer = (localPlayerPos - rootPart.Position).Magnitude
+                        local bones = ResolveBones(character)
+
+                        table.insert(entities, {
+                            Combatant = combatant,
+                            Character = character,
+                            RootPart = rootPart,
+                            Head = head,
+                            Bones = bones,
+                            Health = health,
+                            MaxHealth = maxHealth,
+                            Name = name,
+                            IsBot = isBot,
+                            IsEnemy = isEnemy,
+                            DistanceCamera = distStuds,
+                            DistancePlayer = distPlayer,
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    CachedEntities = entities
+    return entities
+end
+
+function Bloxstrike:UpdateVisuals()
+    local center = Vector2.new(CurrentCamera.ViewportSize.X / 2, CurrentCamera.ViewportSize.Y / 2)
+
+    -- FOV Primitives
+    if SilentFOVCircle then
+        SilentFOVCircle.Visible = Config.Features.SilentAim.Enabled and Config.Features.SilentAim.DrawFOV
+        SilentFOVCircle.Radius = Config.Features.SilentAim.FOV
+        SilentFOVCircle.Position = center
+        SilentFOVCircle.Color = Config.Features.SilentAim.FOVColor
+    end
+
+    if AimFOVCircle then
+        AimFOVCircle.Visible = Config.Features.Aimbot.Enabled and Config.Features.Aimbot.DrawFOV
+        AimFOVCircle.Radius = Config.Features.Aimbot.FOV
+        AimFOVCircle.Position = center
+        AimFOVCircle.Color = Config.Features.Aimbot.FOVColor
+    end
+
+    -- Hit-Registration HUD Telemetry
+    if not HitHUD then
+        HitHUD = Drawing.new("Text")
+        HitHUD.Size = 13
+        HitHUD.Outline = true
+        HitHUD.Color = Color3.fromRGB(0, 255, 170)
+        HitHUD.Visible = false
+    end
+
+    if Config.Features.HitVerifier.DrawHUD and HitHUD then
+        local acc = (HitVerifierState.TotalFired > 0) and math.floor((HitVerifierState.TotalHits / HitVerifierState.TotalFired) * 100) or 100
+        HitHUD.Position = Config.Features.HitVerifier.HUDPosition
+        HitHUD.Text = string.format("BloxStrike HvH Verifier: %d/%d hits (%d%%) · Ping: %dms · Resolver: %s",
+            HitVerifierState.TotalHits, HitVerifierState.TotalFired, acc, HitVerifierState.LastLatencyMs, Config.Features.Resolver.Mode)
+        HitHUD.Visible = true
+    elseif HitHUD then
+        HitHUD.Visible = false
+    end
+
+    if not Config.Features.ESP.Enabled then
+        for _, d in pairs(ESPRegistry) do
+            d.Box.Visible = false
+            d.BoxOutline.Visible = false
+            d.Name.Visible = false
+            d.Distance.Visible = false
+            d.HealthBar.Visible = false
+            d.HealthBarOutline.Visible = false
+            for _, l in ipairs(d.SkeletonLines) do l.Visible = false end
+        end
+        return
+    end
+
+    local entities = self:UpdateEntityCache()
+    local presentCombatants = {}
+
+    for _, ent in ipairs(entities) do
+        presentCombatants[ent.Combatant] = true
+
+        if ent.DistanceCamera <= Config.Features.ESP.MaxDistance then
+            local drawings = ESPRegistry[ent.Combatant]
+            if not drawings then
+                drawings = CreateDrawings(ent)
+                ESPRegistry[ent.Combatant] = drawings
+            end
+
+            local rootPos, onScreen = CurrentCamera:WorldToViewportPoint(ent.RootPart.Position)
+            if onScreen and rootPos.Z > 0 then
+                local headPos = CurrentCamera:WorldToViewportPoint(ent.Head.Position + Vector3.new(0, 0.6, 0))
+                local legPos = CurrentCamera:WorldToViewportPoint(ent.RootPart.Position - Vector3.new(0, 3.0, 0))
+
+                local height = math.abs(headPos.Y - legPos.Y)
+                local width = height * 0.65
+                local boxX = rootPos.X - (width / 2)
+                local boxY = headPos.Y
+
+                local color = ent.IsEnemy and (self:IsDirectVisible(CurrentCamera.CFrame.Position, ent.Head.Position) and Config.Features.ESP.EnemyVisibleColor or Config.Features.ESP.EnemyHiddenColor) or Config.Features.ESP.TeamColor
+
+                -- 2D Bounding Box
+                if Config.Features.ESP.Boxes then
+                    drawings.BoxOutline.Size = Vector2.new(width, height)
+                    drawings.BoxOutline.Position = Vector2.new(boxX, boxY)
+                    drawings.BoxOutline.Visible = true
+
+                    drawings.Box.Size = Vector2.new(width, height)
+                    drawings.Box.Position = Vector2.new(boxX, boxY)
+                    drawings.Box.Color = color
+                    drawings.Box.Visible = true
+                else
+                    drawings.Box.Visible = false
+                    drawings.BoxOutline.Visible = false
+                end
+
+                -- Name & Distance
+                if Config.Features.ESP.Names then
+                    drawings.Name.Text = ent.Name
+                    drawings.Name.Position = Vector2.new(rootPos.X, boxY - 14)
+                    drawings.Name.Visible = true
+                else
+                    drawings.Name.Visible = false
+                end
+
+                if Config.Features.ESP.Distance then
+                    drawings.Distance.Text = string.format("%d studs", math.floor(ent.DistancePlayer))
+                    drawings.Distance.Position = Vector2.new(rootPos.X, boxY + height + 2)
+                    drawings.Distance.Visible = true
+                else
+                    drawings.Distance.Visible = false
+                end
+
+                -- Dynamic Health Bar
+                if Config.Features.ESP.HealthBar then
+                    local barX = boxX - 6
+                    local hpPct = math.clamp(ent.Health / ent.MaxHealth, 0, 1)
+                    local barHeight = height * hpPct
+
+                    drawings.HealthBarOutline.From = Vector2.new(barX, boxY - 1)
+                    drawings.HealthBarOutline.To = Vector2.new(barX, boxY + height + 1)
+                    drawings.HealthBarOutline.Visible = true
+
+                    drawings.HealthBar.From = Vector2.new(barX, boxY + height)
+                    drawings.HealthBar.To = Vector2.new(barX, boxY + height - barHeight)
+                    drawings.HealthBar.Color = Color3.fromHSV(hpPct * 0.33, 1, 1)
+                    drawings.HealthBar.Visible = true
+                else
+                    drawings.HealthBar.Visible = false
+                    drawings.HealthBarOutline.Visible = false
+                end
+
+                -- Skeleton Hierarchy
+                if Config.Features.ESP.Skeleton then
+                    local lineIdx = 1
+                    for _, joint in ipairs(SkeletonJoints) do
+                        local p1 = ent.Bones[joint[1]]
+                        local p2 = ent.Bones[joint[2]]
+                        if p1 and p2 and lineIdx <= #drawings.SkeletonLines then
+                            local sp1, vis1 = CurrentCamera:WorldToViewportPoint(p1.Position)
+                            local sp2, vis2 = CurrentCamera:WorldToViewportPoint(p2.Position)
+                            if vis1 and vis2 and sp1.Z > 0 and sp2.Z > 0 then
+                                local line = drawings.SkeletonLines[lineIdx]
+                                line.From = Vector2.new(sp1.X, sp1.Y)
+                                line.To = Vector2.new(sp2.X, sp2.Y)
+                                line.Color = Config.Features.ESP.SkeletonColor
+                                line.Visible = true
+                                lineIdx = lineIdx + 1
+                            end
+                        end
+                    end
+                    for i = lineIdx, #drawings.SkeletonLines do
+                        drawings.SkeletonLines[i].Visible = false
+                    end
+                else
+                    for _, l in ipairs(drawings.SkeletonLines) do l.Visible = false end
+                end
+            else
+                drawings.Box.Visible = false
+                drawings.BoxOutline.Visible = false
+                drawings.Name.Visible = false
+                drawings.Distance.Visible = false
+                drawings.HealthBar.Visible = false
+                drawings.HealthBarOutline.Visible = false
+                for _, l in ipairs(drawings.SkeletonLines) do l.Visible = false end
+            end
+        end
+    end
+
+    -- Sweep dead or out-of-scope combatants
+    for combatant, drawings in pairs(ESPRegistry) do
+        if not presentCombatants[combatant] then
+            drawings.Box:Remove()
+            drawings.BoxOutline:Remove()
+            drawings.Name:Remove()
+            drawings.Distance:Remove()
+            drawings.HealthBar:Remove()
+            drawings.HealthBarOutline:Remove()
+            for _, l in ipairs(drawings.SkeletonLines) do l:Remove() end
+            ESPRegistry[combatant] = nil
+        end
+    end
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §14 — EXECUTION LOOPS (HEARTBEAT & RENDERSTEPPED)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local RunConnections = {}
+local AimbotHolding = false
+local TriggerHolding = false
+
+function Bloxstrike:StartLoops()
+    self:InstallBypass()
+
+    SilentFOVCircle = EnsureCircle("SilentFOV", Config.Features.SilentAim.FOVColor, Config.Features.SilentAim.FOV)
+    AimFOVCircle = EnsureCircle("AimFOV", Config.Features.Aimbot.FOVColor, Config.Features.Aimbot.FOV)
+
+    -- 1. Heartbeat: Backtrack record buffering & entity cache refresh
+    table.insert(RunConnections, RunService.Heartbeat:Connect(function()
+        self:UpdateBacktrackRecords()
+    end))
+
+    -- 2. RenderStepped: Visuals update & frame-perfect Silent Aim target resolution
+    table.insert(RunConnections, RunService.RenderStepped:Connect(function(dt)
+        self:UpdateVisuals()
+
+        if Config.Features.SilentAim.Enabled then
+            ActiveSilentTarget = self:ResolveTarget({
+                FOV = Config.Features.SilentAim.FOV,
+                TargetPart = Config.Features.SilentAim.TargetPart,
+                VisibleOnly = Config.Features.SilentAim.VisibleOnly,
+                PriorityMode = "ThreatPriority",
+            })
+        else
+            ActiveSilentTarget = nil
+        end
+
+        -- Smooth camera aim assist
+        if Config.Features.Aimbot.Enabled and AimbotHolding then
+            local aimTarget = self:ResolveTarget({
+                FOV = Config.Features.Aimbot.FOV,
+                TargetPart = Config.Features.Aimbot.TargetPart,
+                VisibleOnly = Config.Features.Aimbot.VisibleOnly,
+                PriorityMode = Config.Features.Aimbot.TargetMode,
+            })
+
+            if aimTarget and aimTarget.ScreenPosition then
+                local center = Vector2.new(CurrentCamera.ViewportSize.X / 2, CurrentCamera.ViewportSize.Y / 2)
+                local delta = (aimTarget.ScreenPosition - center)
+                local smooth = math.clamp(Config.Features.Aimbot.Smoothness, 0.01, 1.0)
+                local moveVector = delta * (1 - smooth)
+
+                if mousemoverel then
+                    mousemoverel(moveVector.X, moveVector.Y)
+                else
+                    pcall(function()
+                        VirtualInputManager:SendMouseMoveEvent(center.X + moveVector.X, center.Y + moveVector.Y, game)
+                    end)
+                end
+            end
+        end
+
+        -- Triggerbot validation
+        if Config.Features.Triggerbot.Enabled then
+            local center = Vector2.new(CurrentCamera.ViewportSize.X / 2, CurrentCamera.ViewportSize.Y / 2)
+            local triggerTarget = self:ResolveTarget({
+                FOV = Config.Features.Triggerbot.FOVTolerance,
+                TargetPart = "Head",
+                VisibleOnly = Config.Features.Triggerbot.VisibleOnly,
+                PriorityMode = "Crosshair",
+            })
+
+            if triggerTarget then
+                if not TriggerHolding then
+                    TriggerHolding = true
+                    task.delay(Config.Features.Triggerbot.DelayMs / 1000, function()
+                        if TriggerHolding then
+                            pcall(function()
+                                VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
+                                if Config.Features.Triggerbot.Mode == "Tap" then
+                                    task.wait(0.02)
+                                    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+                                    TriggerHolding = false
+                                end
+                            end)
+                        end
+                    end)
+                end
+            else
+                if TriggerHolding and Config.Features.Triggerbot.Mode == "Hold" then
+                    TriggerHolding = false
+                    pcall(function()
+                        VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+                    end)
+                end
+            end
+        end
+    end))
+
+    -- Keybind handling
+    table.insert(RunConnections, UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton2 then
+            AimbotHolding = true
+        end
+    end))
+
+    table.insert(RunConnections, UserInputService.InputEnded:Connect(function(input, gpe)
+        if input.UserInputType == Enum.UserInputType.MouseButton2 then
+            AimbotHolding = false
+        end
+    end))
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §15 — USER INTERFACE INTEGRATION (lib.lua / Gamesense)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+function Bloxstrike:BuildUI()
+    local Library, ThemeManager, SaveManager
+
+    -- Stage 1: Load from local disk
+    local okRead, content = pcall(readfile, "lib.lua")
+    if okRead and content and content ~= "" then
+        local fn = loadstring(content)
+        if fn then
+            Library, ThemeManager, SaveManager = fn()
+        end
+    end
+
+    -- Stage 2: Fallback remote repository
+    if not Library then
+        local rawUrl = "https://raw.githubusercontent.com/xvbxvvv/xxxxxxxxxxxxx/main/lib.lua"
+        pcall(function()
+            local remoteContent = game:HttpGet(rawUrl)
+            local fn = loadstring(remoteContent)
+            if fn then
+                Library, ThemeManager, SaveManager = fn()
+            end
+        end)
+    end
+
+    -- Stage 3: Global environment fallback
+    if not Library and getgenv().Library then
+        Library = getgenv().Library
+        ThemeManager = getgenv().ThemeManager
+        SaveManager = getgenv().SaveManager
+    end
+
+    assert(Library, "[Bloxstrike::UI] Impossible to initialize lib.lua UI engine")
+
+    local Window = Library:CreateWindow({
+        Title = 'Bloxstrike · ezwin.cc',
+        Center = true,
+        AutoShow = true,
+        TabPadding = 6,
+        MenuFadeTime = 0.2,
+    })
+
+    -- ─── TAB 1: HVH & RAGE ───
+    local HvHTab = Window:AddTab({ Name = 'HvH & Rage', Icon = 'Combat' })
+    local ResolverBox = HvHTab:AddLeftGroupbox('Desync Resolver')
+
+    ResolverBox:AddToggle('ResolverEnabled', {
+        Text = 'Enable Desync Resolver',
+        Default = Config.Features.Resolver.Enabled,
+        Tooltip = 'Back-calculates true hitbox orientation from MovementV2 velocity',
+        Callback = function(v) Config.Features.Resolver.Enabled = v end
+    })
+
+    ResolverBox:AddDropdown('ResolverMode', {
+        Text = 'Resolution Algorithm',
+        Values = { 'AdaptiveAuto', 'KinematicVelocity', 'AnimationYawDelta', 'InvertedFake' },
+        Default = 1,
+        Callback = function(v) Config.Features.Resolver.Mode = v end
+    })
+
+    ResolverBox:AddSlider('ResolverThreshold', {
+        Text = 'Desync Yaw Disparity (°)',
+        Min = 15,
+        Max = 90,
+        Default = Config.Features.Resolver.DesyncThresholdDegrees,
+        Rounding = 0,
+        Callback = function(v) Config.Features.Resolver.DesyncThresholdDegrees = v end
+    })
+
+    local BacktrackBox = HvHTab:AddLeftGroupbox('Lag Compensation & Backtrack')
+    BacktrackBox:AddToggle('BacktrackEnabled', {
+        Text = 'Enable Backtrack',
+        Default = Config.Features.Backtrack.Enabled,
+        Tooltip = 'Stores per-player hitbox history to exploit server rewind window',
+        Callback = function(v) Config.Features.Backtrack.Enabled = v end
+    })
+
+    BacktrackBox:AddSlider('BacktrackWindow', {
+        Text = 'Rewind Window (ms)',
+        Min = 50,
+        Max = 200,
+        Default = Config.Features.Backtrack.WindowMs,
+        Rounding = 0,
+        Callback = function(v) Config.Features.Backtrack.WindowMs = v end
+    })
+
+    BacktrackBox:AddToggle('FavorStationary', {
+        Text = 'Prioritize Stationary Ticks',
+        Default = Config.Features.Backtrack.FavorStationary,
+        Callback = function(v) Config.Features.Backtrack.FavorStationary = v end
+    })
+
+    local WallbangBox = HvHTab:AddLeftGroupbox('Penetration & Wallbang Solver')
+    WallbangBox:AddToggle('WallbangEnabled', {
+        Text = 'Auto-Wall Penetration',
+        Default = Config.Features.Wallbang.Enabled,
+        Tooltip = 'Audits barrier material thickness against weapon penetration threshold',
+        Callback = function(v) Config.Features.Wallbang.Enabled = v end
+    })
+
+    WallbangBox:AddSlider('MinWallbangDamage', {
+        Text = 'Min Penetration Damage',
+        Min = 5,
+        Max = 80,
+        Default = Config.Features.Wallbang.MinDamage,
+        Rounding = 0,
+        Callback = function(v) Config.Features.Wallbang.MinDamage = v end
+    })
+
+    WallbangBox:AddToggle('ThroughDoors', {
+        Text = 'Penetrate Breakable Doors',
+        Default = Config.Features.Wallbang.ThroughBreakableDoors,
+        Callback = function(v) Config.Features.Wallbang.ThroughBreakableDoors = v end
+    })
+
+    local AntiAimBox = HvHTab:AddRightGroupbox('Anti-Aim & Fake Angles')
+    AntiAimBox:AddToggle('AntiAimEnabled', {
+        Text = 'Enable Anti-Aim',
+        Default = Config.Features.AntiAim.Enabled,
+        Tooltip = 'Desyncs rendered hitbox from server orientation when targeted',
+        Callback = function(v) Config.Features.AntiAim.Enabled = v end
+    })
+
+    AntiAimBox:AddDropdown('AntiAimYaw', {
+        Text = 'Yaw Desync Mode',
+        Values = { 'Backward', 'Jitter', 'Spin', 'DesyncFlip' },
+        Default = 1,
+        Callback = function(v) Config.Features.AntiAim.YawMode = v end
+    })
+
+    AntiAimBox:AddDropdown('AntiAimPitch', {
+        Text = 'Pitch Mode',
+        Values = { 'Down', 'Up', 'Zero', 'Jitter' },
+        Default = 1,
+        Callback = function(v) Config.Features.AntiAim.PitchMode = v end
+    })
+
+    AntiAimBox:AddSlider('JitterAngle', {
+        Text = 'Jitter Delta (°)',
+        Min = 30,
+        Max = 180,
+        Default = Config.Features.AntiAim.JitterDelta,
+        Rounding = 0,
+        Callback = function(v) Config.Features.AntiAim.JitterDelta = v end
+    })
+
+    local LeadBox = HvHTab:AddRightGroupbox('Projectile & Kinematic Lead')
+    LeadBox:AddToggle('LeadEnabled', {
+        Text = 'Enable Lead Prediction',
+        Default = Config.Features.LeadPrediction.Enabled,
+        Tooltip = 'Leads targets by flight time and ping latency',
+        Callback = function(v) Config.Features.LeadPrediction.Enabled = v end
+    })
+
+    LeadBox:AddSlider('PingCompensation', {
+        Text = 'Ping Compensation (ms)',
+        Min = 20,
+        Max = 250,
+        Default = Config.Features.LeadPrediction.FixedPingMs,
+        Rounding = 0,
+        Callback = function(v) Config.Features.LeadPrediction.FixedPingMs = v end
+    })
+
+    local VerifierBox = HvHTab:AddRightGroupbox('Hit Verifier & Priority')
+    VerifierBox:AddToggle('VerifierHUD', {
+        Text = 'Show Hit-Registration HUD',
+        Default = Config.Features.HitVerifier.DrawHUD,
+        Callback = function(v) Config.Features.HitVerifier.DrawHUD = v end
+    })
+
+    VerifierBox:AddSlider('AutoCorrectMisses', {
+        Text = 'Misses Before Resolver Invert',
+        Min = 1,
+        Max = 5,
+        Default = Config.Features.HitVerifier.AutoCorrectOnMisses,
+        Rounding = 0,
+        Callback = function(v) Config.Features.HitVerifier.AutoCorrectOnMisses = v end
+    })
+
+    -- ─── TAB 2: COMBAT (Silent Aim & Security) ───
+    local CombatTab = Window:AddTab({ Name = 'Combat', Icon = 'Combat' })
+    local SilentBox = CombatTab:AddLeftGroupbox('Silent Aim')
+
+    SilentBox:AddToggle('SilentAim', {
+        Text = 'Enable Silent Aim',
+        Default = Config.Features.SilentAim.Enabled,
+        Callback = function(v) Config.Features.SilentAim.Enabled = v end
+    }):AddKeyPicker('SilentAimKey', {
+        Default = 'None',
+        SyncToggleState = true,
+        Mode = 'Toggle',
+        Text = 'Silent Aim'
+    })
+
+    SilentBox:AddDropdown('SilentAimPart', {
+        Text = 'Hitbox Target',
+        Values = { 'Head', 'HumanoidRootPart' },
+        Default = 1,
+        Callback = function(v) Config.Features.SilentAim.TargetPart = v end
+    })
+
+    SilentBox:AddSlider('SilentAimFOV', {
+        Text = 'FOV Radius',
+        Min = 10,
+        Max = 400,
+        Default = Config.Features.SilentAim.FOV,
+        Rounding = 0,
+        Callback = function(v) Config.Features.SilentAim.FOV = v end
+    })
+
+    SilentBox:AddSlider('SilentAimHitChance', {
+        Text = 'Hit Chance (%)',
+        Min = 1,
+        Max = 100,
+        Default = Config.Features.SilentAim.HitChance,
+        Rounding = 0,
+        Callback = function(v) Config.Features.SilentAim.HitChance = v end
+    })
+
+    SilentBox:AddToggle('SilentAimVisibleOnly', {
+        Text = 'Visible Only',
+        Default = Config.Features.SilentAim.VisibleOnly,
+        Callback = function(v) Config.Features.SilentAim.VisibleOnly = v end
+    })
+
+    local BypassBox = CombatTab:AddRightGroupbox('BAC Security & Token Bucket')
+    BypassBox:AddToggle('BypassRateLimits', {
+        Text = 'Enforce 20 RPS Token Bucket',
+        Default = Config.Bypass.EnforceRateLimits,
+        Callback = function(v) Config.Bypass.EnforceRateLimits = v end
+    })
+
+    BypassBox:AddToggle('SilenceBAC', {
+        Text = 'Block BAC Probe Remote',
+        Default = Config.Bypass.SilenceBAC,
+        Callback = function(v) Config.Bypass.SilenceBAC = v end
+    })
+
+    -- ─── TAB 3: LEGIT (Aimbot & Triggerbot) ───
+    local LegitTab = Window:AddTab({ Name = 'Legit', Icon = 'Legit' })
+    local AimBox = LegitTab:AddLeftGroupbox('Camera Aim Assist')
+
+    AimBox:AddToggle('Aimbot', {
+        Text = 'Enable Aimbot',
+        Default = Config.Features.Aimbot.Enabled,
+        Callback = function(v) Config.Features.Aimbot.Enabled = v end
+    })
+
+    AimBox:AddSlider('AimbotFOV', {
+        Text = 'Aimbot FOV',
+        Min = 10,
+        Max = 250,
+        Default = Config.Features.Aimbot.FOV,
+        Rounding = 0,
+        Callback = function(v) Config.Features.Aimbot.FOV = v end
+    })
+
+    AimBox:AddSlider('AimbotSmoothness', {
+        Text = 'Smoothing Factor',
+        Min = 0.05,
+        Max = 0.80,
+        Default = Config.Features.Aimbot.Smoothness,
+        Rounding = 2,
+        Callback = function(v) Config.Features.Aimbot.Smoothness = v end
+    })
+
+    local TriggerBox = LegitTab:AddRightGroupbox('Triggerbot')
+    TriggerBox:AddToggle('Triggerbot', {
+        Text = 'Enable Triggerbot',
+        Default = Config.Features.Triggerbot.Enabled,
+        Callback = function(v) Config.Features.Triggerbot.Enabled = v end
+    })
+
+    -- ─── TAB 4: VISUALS (ESP & Skeleton) ───
+    local VisualsTab = Window:AddTab({ Name = 'Visuals', Icon = 'Visuals' })
+    local ESPBox = VisualsTab:AddLeftGroupbox('Player ESP')
+
+    ESPBox:AddToggle('ESPBoxes', {
+        Text = '2D Bounding Boxes',
+        Default = Config.Features.ESP.Boxes,
+        Callback = function(v) Config.Features.ESP.Boxes = v end
+    })
+
+    ESPBox:AddToggle('ESPSkeleton', {
+        Text = 'Skeleton Joints',
+        Default = Config.Features.ESP.Skeleton,
+        Callback = function(v) Config.Features.ESP.Skeleton = v end
+    })
+
+    ESPBox:AddToggle('ESPNames', {
+        Text = 'Player Names',
+        Default = Config.Features.ESP.Names,
+        Callback = function(v) Config.Features.ESP.Names = v end
+    })
+
+    ESPBox:AddToggle('ESPHealth', {
+        Text = 'Health Bars',
+        Default = Config.Features.ESP.HealthBar,
+        Callback = function(v) Config.Features.ESP.HealthBar = v end
+    })
+
+    -- ─── TAB 5: SETTINGS ───
+    Window:CreateSettingsTab({
+        Folder = 'bloxstrike',
+        ConfigFolder = 'bloxstrike/configs',
+        Position = 'Bottom',
+    })
+
+    Library:SetWatermark('ezwin.cc · Bloxstrike HvH v9958')
+    Library:SetWatermarkVisibility(true)
+
+    Library:OnUnload(function()
+        Bloxstrike:Unload()
+    end)
+
+    self.Window = Window
+    self.Library = Library
+end
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- §16 — UNLOAD & LIFECYCLE MANAGEMENT (REVERSE PATH)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+function Bloxstrike:Unload()
+    for _, conn in ipairs(RunConnections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(RunConnections)
+
+    for _, unhook in ipairs(BypassState.Hooks) do
+        pcall(unhook)
+    end
+    table.clear(BypassState.Hooks)
+
+    if SilentFOVCircle then
+        pcall(function() SilentFOVCircle:Remove() end)
+        SilentFOVCircle = nil
+    end
+
+    if AimFOVCircle then
+        pcall(function() AimFOVCircle:Remove() end)
+        AimFOVCircle = nil
+    end
+
+    if HitHUD then
+        pcall(function() HitHUD:Remove() end)
+        HitHUD = nil
+    end
+
+    for _, drawings in pairs(ESPRegistry) do
+        pcall(function()
+            drawings.Box:Remove()
+            drawings.BoxOutline:Remove()
+            drawings.Name:Remove()
+            drawings.Distance:Remove()
+            drawings.HealthBar:Remove()
+            drawings.HealthBarOutline:Remove()
+            for _, line in ipairs(drawings.SkeletonLines) do line:Remove() end
+        end)
+    end
+    table.clear(ESPRegistry)
+    table.clear(BacktrackBuffer)
+    table.clear(CachedEntities)
+
+    print("[Bloxstrike::Core] Unloaded cleanly · Reverse path complete.")
+end
+
+-- Initialize engine and user interface
+Bloxstrike:StartLoops()
+Bloxstrike:BuildUI()
+
+getgenv().Bloxstrike = Bloxstrike
+return Bloxstrike
